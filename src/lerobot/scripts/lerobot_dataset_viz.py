@@ -86,8 +86,8 @@ import tqdm
 
 from lerobot.configs import DEPTH_MILLIMETER_UNIT
 from lerobot.datasets import LeRobotDataset
-from lerobot.utils.constants import ACTION, DONE, OBS_STATE, REWARD, SUCCESS, TASK
-from lerobot.utils.utils import init_logging
+from lerobot.utils.constants import ACTION, DEFAULT_FEATURES, DONE, OBS_STATE, REWARD, SUCCESS, TASK
+from lerobot.utils.utils import init_logging, is_valid_numpy_dtype_string
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +108,19 @@ def get_feature_names(dataset: LeRobotDataset, key: str) -> list[str]:
         return [str(name) for name in names]
 
     return [f"{key}_{d}" for d in range(dim)]
+
+
+def get_extra_scalar_keys(dataset: LeRobotDataset) -> list[str]:
+    """Return numeric 1-D features that have no dedicated view (e.g. ``observation.environment_state``)."""
+    skip = {*DEFAULT_FEATURES, TASK, ACTION, OBS_STATE, DONE, REWARD, SUCCESS}
+    return [
+        key
+        for key, ft in dataset.features.items()
+        if key not in skip
+        and len(ft["shape"]) == 1
+        and is_valid_numpy_dtype_string(ft["dtype"])
+        and np.dtype(ft["dtype"]).kind in "biuf"  # bool, int, uint, float
+    ]
 
 
 def check_chw_float32(frame: torch.Tensor) -> None:
@@ -135,9 +148,9 @@ def to_hwc_float32_numpy(chw_float32_torch: torch.Tensor) -> np.ndarray:
 def build_blueprint_from_dataset(dataset: LeRobotDataset):
     """Build a Rerun blueprint laying out camera images and time series for the given dataset.
 
-    Camera images and scalar signals (action, state, reward, done, success) are arranged in a grid,
-    alongside a text view showing the natural-language task. The per-dimension series names for
-    ``action`` and ``state`` are applied directly via blueprint overrides.
+    Camera images and scalar signals (action, state, reward, done, success and any other numeric
+    1-D feature) are arranged in a grid, alongside a text view showing the natural-language task.
+    Per-dimension series names are applied directly via blueprint overrides.
     """
     import rerun as rr
     import rerun.blueprint as rrb
@@ -153,6 +166,9 @@ def build_blueprint_from_dataset(dataset: LeRobotDataset):
     for key in (DONE, REWARD, SUCCESS):
         if key in dataset.features:
             views.append(rrb.TimeSeriesView(origin=key, name=key))
+    for key in get_extra_scalar_keys(dataset):
+        styling = rr.SeriesLines(names=get_feature_names(dataset, key))
+        views.append(rrb.TimeSeriesView(origin=key, name=key, overrides={key: styling}))
 
     # Put the language instruction in a thin banner across the top rather than in the grid: it is a
     # single line of text, so a full grid cell would waste space and break up the camera layout.
@@ -254,6 +270,8 @@ def visualize_dataset(
         hi = stats["q99"] if "q99" in stats else stats["max"]
         depth_ranges[key] = (float(np.asarray(lo).item()), float(np.asarray(hi).item()))
 
+    extra_scalar_keys = get_extra_scalar_keys(dataset)
+
     first_index = None
     prev_task = None
     for batch in tqdm.tqdm(dataloader, total=len(dataloader)):
@@ -297,6 +315,10 @@ def visualize_dataset(
 
             if SUCCESS in batch:
                 rr.log(SUCCESS, rr.Scalars(batch[SUCCESS][i].item()))
+
+            # display any other numeric features (e.g. environment state, intervention flags)
+            for key in extra_scalar_keys:
+                rr.log(key, rr.Scalars(batch[key][i].numpy()))
 
             # display the natural-language task (re-logged only when it changes)
             # Markdown renders it as a heading in the thin banner.
